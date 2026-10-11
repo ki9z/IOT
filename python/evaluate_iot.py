@@ -16,12 +16,14 @@ import certifi
 from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import PyMongoError
+from latency_utils import summarize_durations
 
 load_dotenv()
 URI = os.getenv('MONGO_URI','').strip()
 DB = os.getenv('MONGO_DB','iot_lab2')
 RAW = os.getenv('MONGO_COLLECTION','iot_raw')
 PROC = os.getenv('MONGO_PROCESSED_COLLECTION','iot_processed')
+METRICS = os.getenv('MONGO_WRITE_METRICS_COLLECTION','iot_write_metrics')
 MAX = 10000
 
 
@@ -76,7 +78,7 @@ def main():
     with MongoClient(URI,tlsCAFile=certifi.where(),serverSelectionTimeoutMS=12000) as cli:
         cli.admin.command('ping')
         db=cli[DB]
-        infos={x['name']:x for x in db.list_collections() if x['name'] in (RAW,PROC)}
+        infos={x['name']:x for x in db.list_collections() if x['name'] in (RAW,PROC,METRICS)}
         raw=db[RAW]
         count=raw.count_documents({})
         proc_count=db[PROC].count_documents({}) if PROC in infos else 0
@@ -101,9 +103,35 @@ def main():
         for d in docs:bydev[str(d.get('metadata',{}).get('device_id','unknown'))].append(d)
         for device, rows in sorted(bydev.items()):
             lines+=['','Device: '+device]+inspect_one(rows, device)
+        if METRICS in infos:
+            metric_total = db[METRICS].count_documents({})
+            measured = list(db[METRICS].find(
+                {}, {'_id': 0, 'mongodb_insert_ms': 1, 'collector_to_db_ms': 1}
+            ).sort('stored_at', -1).limit(MAX))
+            perf = summarize_durations(measured)
+            lines += [
+                '',
+                'HIỆU NĂNG GHI (collector V2 có đo đồng hồ đơn điệu):',
+                'Collection: ' + METRICS,
+                'Tổng phép đo: ' + str(metric_total),
+                'Số phép đo đã phân tích: ' + str(perf['measurements']),
+                'Trung vị MongoDB insert_one() (ms): ' +
+                    median_str([r['mongodb_insert_ms'] for r in measured
+                                if isinstance(r.get('mongodb_insert_ms'), (int, float))]),
+                'Trung vị callback MQTT → MongoDB xác nhận (ms): ' +
+                    median_str([r['collector_to_db_ms'] for r in measured
+                                if isinstance(r.get('collector_to_db_ms'), (int, float))]),
+            ]
+            if metric_total > MAX:
+                lines.append(f'Chú ý: thống kê độ trễ dựa trên {MAX} phép đo mới nhất.')
+        else:
+            lines += ['', 'HIỆU NĂNG GHI: Chưa có ' + METRICS +
+                      '. Hãy chạy collector V2 phiên bản mới để ghi phép đo.']
+
         lines+=['','GIỚI HẠN ĐÁNH GIÁ:',
                 '- received_at - time chứa sai lệch đồng hồ; KHÔNG phải đo độ trễ mạng MQTT hoặc end-to-end chính xác.',
-                '- Cần thêm thời điểm ngay sau insert_one() thành công để đo thời gian ghi MongoDB.',
+                '- Thời gian MongoDB insert_one và callback→DB là kết quả đo monotonic của Python, không bao gồm MQTT/Wokwi.',
+                '- Để đo end-to-end (thiết bị→DB) chính xác cần đồng bộ và kiểm chứng NTP/đồng hồ thiết bị và máy Python.',
                 '- Sequence thiếu có thể do tắt collector, publish lỗi, restart, hoặc rơi tin QoS 0.',
                 '- Thống kê dựa trên bản ghi đã lưu (chưa đo các tin chưa được tiếp nhận).']
         payload='\n'.join(lines)+'\n'
