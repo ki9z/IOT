@@ -36,6 +36,7 @@ MONGO_URI = os.getenv("MONGO_URI", "").strip()
 DB_NAME = os.getenv("MONGO_DB", "iot_lab2").strip()
 RAW_NAME = os.getenv("MONGO_COLLECTION", "iot_raw").strip()
 PROCESSED_NAME = os.getenv("MONGO_PROCESSED_COLLECTION", "iot_processed").strip()
+WRITE_METRICS_NAME = os.getenv("MONGO_WRITE_METRICS_COLLECTION", "iot_write_metrics").strip()
 LOCAL_TZ = "Asia/Ho_Chi_Minh"
 MAX_ROWS = 12000
 
@@ -95,6 +96,22 @@ def read_data(device_id: str, hours: int, window_seconds: int):
     except Exception:
         pass
     return raws, processed, counts, truncated
+
+
+@st.cache_data(ttl=8, show_spinner=False)
+def read_write_metrics(device: str, hours: int):
+    client = mongo_client(MONGO_URI)
+    coll = client[DB_NAME][WRITE_METRICS_NAME]
+    device_filter = {"metadata.device_id": device}
+    latest = coll.find_one(device_filter, {"stored_at": 1}, sort=[("stored_at", DESCENDING)])
+    if latest is None:
+        return []
+    after = latest["stored_at"] - timedelta(hours=hours)
+    return list(coll.find(
+        {**device_filter, "stored_at": {"$gte": after}},
+        {"_id": 0, "stored_at": 1, "mongodb_insert_ms": 1,
+         "collector_to_db_ms": 1}
+    ).sort("stored_at", DESCENDING).limit(MAX_ROWS))
 
 
 def plot_line(data: pd.DataFrame, key: str, label: str, color: str):
@@ -233,8 +250,29 @@ def run_dashboard():
         b.metric("Nghi khởi động lại", f"{audit['reboot_hints']:,}")
         c.metric("Khoảng nhận trung vị", fmt(period, " ms", 0))
         d.metric("Chênh lệch thời gian trung vị", fmt(lag, " ms", 0))
-        st.caption("Chênh lệch thời gian = received_at − time. Không phải độ trễ mạng thuần "
-                   "và chưa bao gồm thời gian ghi xong vào MongoDB. Số mẫu thiếu chỉ là ước lượng theo sequence.")
+        st.caption("Chênh lệch thời gian = received_at − time; có thể bao gồm sai lệch đồng hồ, "
+                   "không được coi là độ trễ MQTT/end-to-end. Số mẫu thiếu chỉ là ước lượng theo sequence.")
+
+        st.subheader("Hiệu năng Python → MongoDB (đo thực tế)")
+        try:
+            write_rows = read_write_metrics(selected_device, hours)
+        except Exception as exc:
+            write_rows = []
+            st.warning("Chưa đọc được iot_write_metrics: " + type(exc).__name__)
+        if write_rows:
+            wdf = pd.DataFrame(write_rows)
+            insert_values = pd.to_numeric(wdf["mongodb_insert_ms"], errors="coerce").dropna()
+            callback_values = pd.to_numeric(wdf["collector_to_db_ms"], errors="coerce").dropna()
+            ma, mb, mc = st.columns(3)
+            ma.metric("Mẫu đo thành công", f"{len(wdf):,}")
+            mb.metric("Trung vị insert_one()", fmt(insert_values.median() if not insert_values.empty else None, " ms", 2))
+            mc.metric("Trung vị callback → DB", fmt(callback_values.median() if not callback_values.empty else None, " ms", 2))
+            st.caption("Hai giá trị này đo bằng đồng hồ đơn điệu perf_counter_ns() tại Python. "
+                       "Chúng không bao gồm thời gian ESP32 → MQTT Broker → Python. "
+                       "Đo end-to-end thực cần đồng bộ và kiểm chứng đồng hồ hai thiết bị.")
+        else:
+            st.info("Chưa có phép đo ghi MongoDB. Chạy mqtt_to_mongodb_v2.py phiên bản đã cập nhật "
+                    "trong vài phút, sau đó làm mới trang.")
         if not processed.empty:
             a, b, c = st.columns(3)
             a.metric("Cửa sổ chưa có bản tin", int(processed.get("was_missing_window", pd.Series(dtype=bool)).fillna(False).astype(bool).sum()))
@@ -308,6 +346,7 @@ with st.sidebar:
     if st.button("🔄 Làm mới ngay"):
         read_data.clear()
         find_devices.clear()
+        read_write_metrics.clear()
     st.caption("Đừng tắt PowerShell đang chạy MQTT collector. Có thể xem dữ liệu cũ khi Wokwi ngừng.")
 
 # Chỉ fragment chạy lại, tránh reload toàn bộ trang mỗi 10 giây.
