@@ -1,0 +1,14 @@
+*.py[cod]
+__pycache__/
+.venv/
+venv/
+.env
+**/.env
+.env.*
+**/.env.*
+!**/.env.example
+*.pem
+*.key
+metrics_report.txt
+*.log
+.DS_Store
