@@ -7,7 +7,11 @@ must run as the ONLY subscriber that writes to iot_raw.
 """
 
 import json
+import os
+import time
+from datetime import datetime, timezone
 
+from latency_utils import build_write_metric
 import paho.mqtt.client as mqtt
 from pymongo import DESCENDING
 from pymongo.errors import PyMongoError
@@ -16,6 +20,8 @@ from pymongo.errors import PyMongoError
 import mqtt_to_mongodb as base
 
 collection = None
+write_metrics_collection = None
+METRICS_NAME = os.getenv("MONGO_WRITE_METRICS_COLLECTION", "iot_write_metrics")
 
 
 def on_connect(client, userdata, flags, reason_code, properties):
@@ -27,6 +33,7 @@ def on_connect(client, userdata, flags, reason_code, properties):
 
 
 def on_message(client, userdata, msg):
+    callback_started = time.perf_counter_ns()
     try:
         d = base.validate_payload(msg.payload)
         device = d["metadata"]["device_id"]
@@ -62,9 +69,30 @@ def on_message(client, userdata, msg):
                 print(f"[ORDER WARNING] sequence decreased {prev_seq} -> {seq}; check reboot/out-of-order data")
 
         d["source_topic"] = msg.topic
+        write_started = time.perf_counter_ns()
         result = collection.insert_one(d)
+        write_ended = time.perf_counter_ns()
+        stored_at = datetime.now(timezone.utc)
+
+        # Both timings below come from the SAME monotonic Python clock.
+        # They exclude sensor-side / MQTT transport time and clock skew.
+        insert_ms = (write_ended - write_started) / 1_000_000
+        collector_ms = (write_ended - callback_started) / 1_000_000
+
+        metric = build_write_metric(
+            d, result.inserted_id, msg.topic, stored_at,
+            insert_ms, collector_ms,
+        )
+        try:
+            write_metrics_collection.insert_one(metric)
+        except PyMongoError as exc:
+            # Raw sample is saved even if diagnostic metrics fail.
+            print(f"[METRICS WARNING] Raw sample saved, metric not saved: {type(exc).__name__}")
+
         print(f"[SAVED] seq={seq}, T={d['temperature']}C, H={d['humidity']}%, "
-              f"distance={d['distance_cm']}cm, id={result.inserted_id}")
+              f"distance={d['distance_cm']}cm, "
+              f"db_write={insert_ms:.2f}ms, collector_to_db={collector_ms:.2f}ms, "
+              f"id={result.inserted_id}")
     except (ValueError, UnicodeError, OverflowError, json.JSONDecodeError) as exc:
         print("[INVALID]", exc)
     except PyMongoError as exc:
@@ -72,10 +100,17 @@ def on_message(client, userdata, msg):
 
 
 def main():
-    global collection
+    global collection, write_metrics_collection
     base.mongo_client.admin.command("ping")
     collection = base.ensure_collection()
+    write_metrics_collection = base.mongo_client[base.DB_NAME][METRICS_NAME]
+    try:
+        # A separate ordinary collection avoids modifying Time-Series samples.
+        write_metrics_collection.create_index("stored_at", expireAfterSeconds=604800)
+    except PyMongoError as exc:
+        print(f"[METRICS WARNING] Unable to ensure metrics TTL: {type(exc).__name__}")
     print("[MONGO] Connected to Atlas")
+    print(f"[METRICS] Writing acknowledged timings into {base.DB_NAME}.{METRICS_NAME}")
     print("[INFO] Run only ONE MQTT->MongoDB collector at a time")
     client = mqtt.Client(callback_api_version=mqtt.CallbackAPIVersion.VERSION2)
     client.on_connect = on_connect
