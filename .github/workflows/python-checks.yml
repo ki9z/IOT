@@ -22,5 +22,7 @@ jobs:
         run: cd python && python -m unittest -v test_latency_utils.py
       - name: Verify dashboard statistics
         run: python python/test_dashboard_metrics.py
+      - name: Verify preprocessing, database boundaries and application flows
+        run: cd python && python -m unittest -v test_preprocessing test_dashboard_data test_dashboard_app
       - name: Demo test preprocessing without Atlas
         run: python python/preprocess_iot.py --demo

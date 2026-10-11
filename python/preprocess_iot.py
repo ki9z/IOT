@@ -18,6 +18,7 @@ import argparse
 import os
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from pathlib import Path
 
 import certifi
 import numpy as np
@@ -26,7 +27,7 @@ from dotenv import load_dotenv
 from pymongo import ASCENDING, DESCENDING, MongoClient, ReplaceOne
 from pymongo.errors import PyMongoError
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name(".env"))
 
 RAW_NAME = os.getenv("MONGO_COLLECTION", "iot_raw").strip()
 DB_NAME = os.getenv("MONGO_DB", "iot_lab2").strip()
@@ -50,8 +51,13 @@ def number_or_none(x: Any):
     return float(x)
 
 
-def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int):
+def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int,
+                       max_buckets: int = 10000):
     """Pure preprocessing function: can be demo-tested without any cloud login."""
+    if window_seconds not in (15, 30, 60, 300):
+        raise ValueError("Unsupported resampling window")
+    if max_buckets <= 0:
+        raise ValueError("max_buckets must be positive")
     if not raw_docs:
         return [], {}
 
@@ -84,6 +90,11 @@ def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int):
 
     invalid_readings = int(df[list(SENSORS)].isna().sum().sum())
     df = df.set_index("time").sort_index()
+    bucket_count = int((df.index.max().floor(f"{window_seconds}s") -
+                        df.index.min().floor(f"{window_seconds}s")).total_seconds()
+                       / window_seconds) + 1
+    if bucket_count > max_buckets:
+        raise ValueError("Too many time buckets; shorten the selected time range")
 
     clean = df[list(SENSORS)].copy()
     flags = pd.DataFrame(index=clean.index)
@@ -114,16 +125,24 @@ def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int):
     anomaly_count = flags.resample(freq).sum().sum(axis=1).reindex(average.index, fill_value=0)
     missing_window = samples.eq(0)
     missing_buckets = int(missing_window.sum())
+    missing_counts = df[list(SENSORS)].isna().astype(int).resample(freq).sum()
+    outlier_counts = flags.resample(freq).sum()
+    filled_counts = {}
 
     # Fill at most TWO internal empty buckets (~60 sec at 30 sec/window).
     # No forward/back fill at series ends, or interpolation across long outages.
     for key in SENSORS:
-        average[key] = average[key].interpolate(
-            method="time", limit=2, limit_area="inside"
-        )
+        missing = average[key].isna()
+        runs = missing.ne(missing.shift()).cumsum()
+        run_size = missing.groupby(runs).transform("sum")
+        interpolated = average[key].interpolate(method="time", limit_area="inside")
+        # Only fill ENTIRE gaps <=2 buckets. pandas limit=2 alone partially
+        # fills longer outages and would manufacture measurements during them.
+        average[key] = average[key].where(~(missing & run_size.le(2)), interpolated)
+        filled_counts[key] = missing & average[key].notna()
         average[f"{key}_rolling_mean_3"] = average[key].rolling(
             window=3, min_periods=1
-        ).mean()
+        ).mean().where(average[key].notna())
         average[f"{key}_delta"] = average[key].diff()
         valid = average[key].dropna()
         if len(valid) and float(valid.max()) > float(valid.min()):
@@ -146,6 +165,10 @@ def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int):
             "outlier_count": int(anomaly_count.loc[t]),
             "processed_at": now,
             "source_collection": RAW_NAME,
+            "pipeline_version": 2,
+            "missing_by_sensor": {key: int(missing_counts.loc[t, key]) for key in SENSORS},
+            "outliers_by_sensor": {key: int(outlier_counts.loc[t, key]) for key in SENSORS},
+            "imputed_by_sensor": {key: bool(filled_counts[key].loc[t]) for key in SENSORS},
         }
         for key in SENSORS:
             for field in (key, f"{key}_rolling_mean_3", f"{key}_delta", f"{key}_norm"):
@@ -157,6 +180,9 @@ def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int):
         "bad_times": bad_times,
         "duplicates_dropped": duplicates,
         "invalid_sensor_values": invalid_readings,
+        "invalid_by_sensor": {key: int(df[key].isna().sum()) for key in SENSORS},
+        "filled_by_sensor": {key: int(filled_counts[key].sum()) for key in SENSORS},
+        "remaining_missing_by_sensor": {key: int(average[key].isna().sum()) for key in SENSORS},
         "outliers_detected": int(flags.sum().sum()),
         "outliers_by_sensor": {key: int(flags[key].sum()) for key in SENSORS},
         "iqr_bounds": limits_summary,
@@ -165,6 +191,32 @@ def to_docs_for_device(raw_docs: list[dict], device: str, window_seconds: int):
         "has_value_buckets": sum(row["temperature"] is not None for row in out),
     }
     return out, stats
+
+
+def save_processed(db, docs, raw_name=RAW_NAME, processed_name=PROCESSED_NAME,
+                   metrics_name=None):
+    """Repeatable writes shared by CLI/dashboard; never touch source data."""
+    reserved = {raw_name, metrics_name or os.getenv(
+        "MONGO_WRITE_METRICS_COLLECTION", "iot_write_metrics")}
+    if processed_name in reserved:
+        raise ValueError("Processed collection must differ from raw and write metrics")
+    if not docs:
+        return {"upserted": 0, "modified": 0, "matched": 0}
+    found = next(db.list_collections(filter={"name": processed_name}), None)
+    if found and "timeseries" in found.get("options", {}):
+        raise ValueError("Processed output requires an ordinary collection; choose a new name")
+    processed = db[processed_name]
+    processed.create_index(
+        [("metadata.device_id", ASCENDING), ("time", ASCENDING),
+         ("window_seconds", ASCENDING)], unique=True, name="uniq_device_time_window")
+    processed.create_index([("time", ASCENDING)], expireAfterSeconds=604800,
+                          name="ttl_processed_time_7d")
+    ops = [ReplaceOne({"metadata.device_id": d["metadata"]["device_id"],
+                       "time": d["time"], "window_seconds": d["window_seconds"]},
+                      d, upsert=True) for d in docs]
+    result = processed.bulk_write(ops, ordered=False)
+    return {"upserted": result.upserted_count, "modified": result.modified_count,
+            "matched": result.matched_count}
 
 
 def test_samples():
@@ -271,40 +323,16 @@ def main():
             if isinstance(device, str) and device.strip():
                 groups.setdefault(device, []).append(d)
 
-        processed = None
-        if not a.dry_run:
-            found = next(db.list_collections(filter={"name": PROCESSED_NAME}), None)
-            if found and "timeseries" in found.get("options", {}):
-                raise SystemExit(
-                    "[ERROR] iot_processed already exists as Time Series. "
-                    "Do not delete it. Set MONGO_PROCESSED_COLLECTION=iot_processed_v2 in .env."
-                )
-            processed = db[PROCESSED_NAME]
-            processed.create_index(
-                [("metadata.device_id", ASCENDING),
-                 ("time", ASCENDING), ("window_seconds", ASCENDING)],
-                unique=True, name="uniq_device_time_window"
-            )
-            # Seven-day TTL for processed records (the source also has its own TTL).
-            processed.create_index(
-                [("time", ASCENDING)], expireAfterSeconds=604800,
-                name="ttl_processed_time_7d"
-            )
         total_upserts = 0
         for device, source in sorted(groups.items()):
             docs, stats = to_docs_for_device(source, device, a.window_seconds)
             if not docs:
                 print(f"[SKIP] {device}: could not preprocess")
                 continue
-            if processed is not None:
-                ops = [ReplaceOne(
-                    {"metadata.device_id": device, "time": d["time"],
-                     "window_seconds": a.window_seconds},
-                    d, upsert=True
-                ) for d in docs]
-                result = processed.bulk_write(ops, ordered=False)
-                total_upserts += result.upserted_count + result.modified_count
-            print_report(device, stats, docs, saved=processed is not None)
+            if not a.dry_run:
+                result = save_processed(db, docs)
+                total_upserts += result["upserted"] + result["modified"]
+            print_report(device, stats, docs, saved=not a.dry_run)
         if a.dry_run:
             print("\n[DRY RUN] Data not written to MongoDB")
         else:
@@ -318,6 +346,6 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (PyMongoError, OSError) as e:
-        print("[ERROR] MongoDB connection/write issue:", type(e).__name__, str(e)[:200])
+    except (PyMongoError, OSError, ValueError) as e:
+        print("[ERROR] Preprocessing failed:", type(e).__name__)
         raise SystemExit(1)

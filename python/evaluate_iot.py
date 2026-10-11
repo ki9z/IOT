@@ -17,8 +17,9 @@ from dotenv import load_dotenv
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import PyMongoError
 from latency_utils import summarize_durations
+from dashboard_metrics import make_frame, sequence_audit, quality_table, numeric_summary
 
-load_dotenv()
+load_dotenv(Path(__file__).with_name('.env'))
 URI = os.getenv('MONGO_URI','').strip()
 DB = os.getenv('MONGO_DB','iot_lab2')
 RAW = os.getenv('MONGO_COLLECTION','iot_raw')
@@ -39,8 +40,10 @@ def median_str(values, suffix=''):
 
 
 def inspect_one(rows, device):
+    frame = make_frame(rows)
+    audit = sequence_audit(frame)
     rows.sort(key=lambda x: utc(x['time']) if utc(x.get('time')) else datetime.min.replace(tzinfo=timezone.utc))
-    seen=set(); duplicates=0; gaps=0; reboots=0; prev=None
+    seen=set(); prev=None
     periods=[]; receive_periods=[]; offset=[]
     for d in rows:
         t=utc(d.get('time'))
@@ -48,7 +51,7 @@ def inspect_one(rows, device):
         seq=d.get('sequence'); uptime=d.get('uptime_s'); rec=utc(d.get('received_at'))
         key=(seq,t)
         if key in seen:
-            duplicates+=1; continue
+            continue
         seen.add(key)
         if rec: offset.append((rec-t).total_seconds()*1000)
         if prev:
@@ -56,19 +59,18 @@ def inspect_one(rows, device):
             dt=(t-pt).total_seconds()*1000
             if dt>0: periods.append(dt)
             if rec and prec and rec>prec: receive_periods.append((rec-prec).total_seconds()*1000)
-            if isinstance(uptime,int) and isinstance(pu,int) and uptime<pu:
-                reboots+=1
-            elif isinstance(seq,int) and isinstance(ps,int) and seq>ps+1:
-                gaps+=seq-ps-1
         prev=(t,seq,uptime,rec)
     return [
         f'  Số bản ghi xét: {len(rows)}',
-        f'  Bản ghi lặp (sequence, time) nghi vấn: {duplicates}',
-        f'  Số sequence nghi thiếu: {gaps}',
-        f'  Dấu hiệu reset thiết bị: {reboots}',
+        f'  Bản ghi lặp (sequence, time) nghi vấn: {audit["duplicates"]}',
+        f'  Số sequence nghi thiếu: {audit["suspected_missing"]}',
+        f'  Dấu hiệu reset thiết bị: {audit["reboot_hints"]}',
         f'  Trung vị chu kỳ time cảm biến: {median_str(periods," ms")}',
         f'  Trung vị chu kỳ Python nhận: {median_str(receive_periods," ms")}',
         f'  Trung vị received_at - time: {median_str(offset," ms")}',
+    ] + ['  Chất lượng cảm biến trong các bản ghi đã lưu:'] + [
+        f'    {r["Cảm biến"]}: thiếu={r["Thiếu"]}, ngoài miền={r["Ngoài miền"]}, hợp lệ={r["Hợp lệ (%)"]:.1f}%'
+        for r in quality_table(frame).to_dict('records') if r['Hợp lệ (%)'] is not None
     ]
 
 
@@ -97,8 +99,9 @@ def main():
                 'metaField: '+str(ts.get('metaField','N/A')),
                 'Retention expireAfterSeconds: '+str(opt.get('expireAfterSeconds','NOT SET'))]
         docs=list(raw.find({}, {'time':1,'received_at':1,'sequence':1,'uptime_s':1,
-                                'metadata.device_id':1}).sort('time',ASCENDING).limit(MAX))
-        if count>MAX:lines.append(f'CẢNH BÁO: Chỉ thống kê {MAX} bản ghi cũ nhất / {count} bản ghi.')
+                                'metadata.device_id':1,'temperature':1,'humidity':1,
+                                'distance_cm':1,'rssi':1}).sort('time',-1).limit(MAX))
+        if count>MAX:lines.append(f'CẢNH BÁO: Chỉ thống kê {MAX} bản ghi mới nhất / {count} bản ghi.')
         bydev=defaultdict(list)
         for d in docs:bydev[str(d.get('metadata',{}).get('device_id','unknown'))].append(d)
         for device, rows in sorted(bydev.items()):
@@ -124,6 +127,11 @@ def main():
             ]
             if metric_total > MAX:
                 lines.append(f'Chú ý: thống kê độ trễ dựa trên {MAX} phép đo mới nhất.')
+            for field in ('mongodb_insert_ms', 'collector_to_db_ms'):
+                summary = numeric_summary([r.get(field) for r in measured])
+                lines.append(f'  {field}: mẫu hợp lệ={summary["count"]}, '
+                             f'mean={summary["mean"]}, P95={summary["p95"]}, '
+                             f'min={summary["min"]}, max={summary["max"]} ms')
         else:
             lines += ['', 'HIỆU NĂNG GHI: Chưa có ' + METRICS +
                       '. Hãy chạy collector V2 phiên bản mới để ghi phép đo.']

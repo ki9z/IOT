@@ -5,5 +5,5 @@ python-dotenv>=1.0,<2
 certifi>=2024
 pandas>=2.0,<3
 numpy>=1.24,<3
-streamlit>=1.38,<2
+streamlit>=1.50,<2
 plotly>=5.20,<7
