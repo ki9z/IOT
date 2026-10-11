@@ -1,0 +1,26 @@
+name: Python source checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: python -m pip install -r python/requirements.txt
+      - name: Compile Python source
+        run: python -m compileall -q python/
+      - name: Verify performance measurement helpers
+        run: cd python && python -m unittest -v test_latency_utils.py
+      - name: Verify dashboard statistics
+        run: python python/test_dashboard_metrics.py
+      - name: Demo test preprocessing without Atlas
+        run: python python/preprocess_iot.py --demo
